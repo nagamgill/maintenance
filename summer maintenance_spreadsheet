@@ -1,0 +1,750 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Mar  8 15:07:30 2022
+use the arcgis enviorment.
+@author: Joel.Atwood
+"""
+#standard library
+import itertools as it
+import functools
+import contextvars
+import threading
+from string import ascii_uppercase
+import asyncio
+import os
+import sys
+from queue import Queue
+import datetime
+from typing import Union
+
+# additional packages
+import tqdm.asyncio
+import pandas as pd
+import numpy as np
+from arcgis.gis import GIS
+
+import openpyxl
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment
+from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.styles import PatternFill
+from openpyxl.chart import PieChart, Reference
+
+
+
+# %% Async get data functions
+
+def logOnArc(username: str, password: str, url="https://www.arcgis.com/"):
+    return GIS(url, username, password)
+
+
+def getFeatureLayer(hashid: str, arcOnlineObj: object):
+    res = arcOnlineObj.content.search(hashid)[0]
+    return res
+
+
+async def to_thread(func, /, *args, **kwargs: object):
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(None, func_call)
+
+
+def fetchTables(i, k):
+    return (i, k.query())
+
+
+def createDct(collection, table_names):
+    all_objects = [collection.layers[0]] + collection.tables
+    return {j: i for i, j in zip(all_objects, table_names)}
+
+
+def generateDF(resObj):
+    dct = resObj.to_dict()
+    return pd.DataFrame([i['attributes'] for i in dct['features']])
+
+
+async def getData(username, password, all_view='5e3b4792bba943de9bc0a6d3db6bee9e', form_view="eb0eda61f1a84827afbbd79d8a0857ba"):
+    results = {}
+    try:
+        table_names = ['met_Data', 'Visits', 'Inventory', 'SiteChar', 'SnoStat', 'Needs',
+                       'SensorChecks', 'SiteDisturbance', 'Telemetry', 'SnowMeas', 'SnowMeasPoints']
+        arcOnlineObj = await to_thread(logOnArc, *(username, password))
+        futureFeature = [
+            to_thread(getFeatureLayer, form_view, arcOnlineObj),
+            to_thread(getFeatureLayer, all_view, arcOnlineObj)
+        ]
+        fetched_tables = await asyncio.gather(*futureFeature)
+        fetched_tables = [createDct(i, table_names) for i in fetched_tables]
+        tables = [fetched_tables[0][i] if i !=
+                  'SnoStat' else fetched_tables[1][i] for i in fetched_tables[0]]
+        colist = [to_thread(fetchTables, i, j)
+                  for i, j in zip(table_names, tables)]
+        for f in tqdm.asyncio.tqdm.as_completed(colist):
+            table_name, resObj = await f
+            results[table_name] = resObj
+        results = {i: j for i, j in zip(
+            results.keys(), map(generateDF, results.values()))}
+    except Exception:
+        print(sys.exc_info())
+    return results
+
+
+# run new event loop in thread - easiest solution when using ipython
+def run_in_thread(username: str, password: str) -> list:
+    def target(q): return q.put(asyncio.run(getData(username, password)))
+    que = Queue()
+    t = threading.Thread(target=target, args=(que,), name="Execute_async")
+    t.start()
+    t.join()
+    return que.get()
+
+
+# %% master metadata from feature layer "collections.layer
+def metaData(metaDBData: object):
+    '''
+    extract metadata from the collections layer
+
+    Parameters
+    ----------
+    metaDBData : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    siteMetData : TYPE
+        DESCRIPTION.
+
+    '''
+    featureMetaData = metaDBData['met_Data']
+    featureMetaData = featureMetaData.loc[((featureMetaData["NETWORK"] == "SNOTEL") | (
+        featureMetaData["NETWORK"] == "SNOLITE")) & (featureMetaData["SITE_ID"] != '386')]
+    siteMetData = featureMetaData[["SITE_NAME", "RECHARGE", 'STATE']].sort_values(
+        by=['STATE', 'SITE_NAME'], ascending=True)
+    return siteMetData
+
+# %% Site visits
+
+
+def sitesRechargedmetaDBData(metaDBData):
+    '''
+    determine if a site needs to still be recharged or not
+
+    Parameters
+    ----------
+    metaDBData : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    sitesRecharged : TYPE
+        DESCRIPTION.
+
+    '''
+    visitsDF = metaDBData['Visits']
+    visitsDF["DATE_VISIT"] = pd.to_datetime(visitsDF["DATE_VISIT"].apply(
+        lambda x: datetime.datetime.fromtimestamp(int(str(x)[:-3]))))
+    sitesRecharged = visitsDF.loc[(visitsDF["DATE_VISIT"].apply(lambda x: x.year) == currentYear) & (
+        visitsDF['RECHARGED'] == 'TRUE'), 'SITE_NAME_VISIT'].to_list()
+    return sitesRecharged
+
+# %% snow state table
+
+
+def dateCompConv(x):
+    '''
+    converts from unix time to datetime obj.
+
+    Parameters
+    ----------
+    x : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    '''
+    try:
+        x_str = str(x)
+        return datetime.datetime.fromtimestamp(int(x_str[:-5]))
+    except:
+        return None
+
+
+def snowStats(metaDBData: dict, sitesRecharged: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    '''
+
+
+    Parameters
+    ----------
+    metaDBData : dict
+        DESCRIPTION.
+    sitesRecharged : pd.DataFrame
+        DESCRIPTION.
+
+    Returns
+    -------
+    maintenance : TYPE
+        DESCRIPTION.
+    Sensor_Issues : TYPE
+        DESCRIPTION.
+    revisits : TYPE
+        DESCRIPTION.
+    latest_visits : TYPE
+        DESCRIPTION.
+
+    '''
+
+    all_SSdf = metaDBData['SnoStat'].dropna(subset='DATE_ADDED_SS').copy()
+    all_SSdf.loc['DATE_ADDED_SS'] = pd.to_datetime(all_SSdf['DATE_ADDED_SS'].astype(
+        str).apply(lambda x: datetime.datetime.fromtimestamp(int(x[:-5]))))
+    all_SSdf['DATECOMPLETE_SS'] = pd.to_datetime(
+        all_SSdf['DATECOMPLETE_SS'].apply(lambda x: dateCompConv(x)))
+    # current needs
+    maintenance = all_SSdf.loc[(all_SSdf['DATECOMPLETE_SS'].isna()) & (
+        all_SSdf['TYPE_SS'] == "Site Need"), ["SITE_NAME_SS", "COMMENTS_SS"]]
+    Sensor_Issues = all_SSdf.loc[(all_SSdf['DATECOMPLETE_SS'].isna()) & (
+        all_SSdf['TYPE_SS'] != "Site Need")].reset_index(drop=True)
+    # determine revisits
+    sever_issues = Sensor_Issues.loc[(Sensor_Issues['URGENCY_SS'] == 'High') | (
+        Sensor_Issues['URGENCY_SS'] == 'Immediately')]
+    revisits = [i for i in sever_issues['SITE_NAME_SS'] if i in sitesRecharged]
+
+    # last year work done
+    last_year = currentYear - 1
+    all_SSdf_all_complete = all_SSdf.loc[all_SSdf['DATECOMPLETE_SS'].notna()]
+    last_year_needs = all_SSdf_all_complete.loc[(all_SSdf_all_complete['DATECOMPLETE_SS'].apply(
+        lambda x: x.year) == last_year) & (all_SSdf_all_complete['TYPE_SS'] == "Site Need")]
+    latest_visits = last_year_needs[["SITE_NAME_SS", 'WORKDONE_SS']]
+    return (maintenance, Sensor_Issues, revisits, latest_visits)
+
+# %% Invitory table
+
+
+def convert_to_datetime(x: Union[int,float]):
+    '''
+
+
+    Parameters
+    ----------
+    x : Union(int,float)
+        DESCRIPTION.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    '''
+    if not np.isnan(x):
+        try:
+            if type(x) == int:
+                return datetime.datetime.fromtimestamp(int(str(x)[:-3]))
+            elif type(x) == float:
+                return datetime.datetime.fromtimestamp(int(str(int(x))[:-3]))
+        except:
+            raise ValueError(
+                f'This did not work: {x} goes to {str(x)} then goes to {str(x)[:-3]} then goes to {int(str(x)[:-3])}')
+    else:
+        return np.nan
+
+# def normalize_height_depth(value):
+#     if pd.isna(value):
+#         return 'unknown length'
+#     try:
+#         return str(float(re.sub("[^0-9.]","",str(value))))+ "'"
+#     except ValueError:
+#         return 'unknown length'
+
+def Invitory(metaDBData:dict):
+    '''
+
+
+    Parameters
+    ----------
+    metaDBData : dict
+        DESCRIPTION.
+
+    Returns
+    -------
+    batts : TYPE
+        DESCRIPTION.
+    txds : TYPE
+        DESCRIPTION.
+    loggers : TYPE
+        DESCRIPTION.
+    solar_rad : TYPE
+        DESCRIPTION.
+    relative_humidity : TYPE
+        DESCRIPTION.
+    wind : TYPE
+        DESCRIPTION.
+
+    '''
+
+    INVdf = metaDBData['Inventory'].copy()
+    ts = INVdf['IN_DATE']
+    INVdf['IN_DATE'] = pd.to_datetime(ts.apply(convert_to_datetime))
+
+    # find sites that need batteries
+    thresh = currentYear - 7
+    batts = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Battery")][["SITE_NAME_INV", "QUANTITY", "LOCATION"]]
+    batts["QUANTITY"] = [int(i) if not np.isnan(i) else 0 for i in batts["QUANTITY"].tolist()]
+
+    #Identify sites without "30 or 37 Conductor Wire"
+    stations = metaDBData['SiteChar']['SITE_NAME_CHAR'].to_list()
+    sites_with_conductor_label = set(INVdf.loc[(INVdf['COMPONENT'] == 'Conductor Wire'), 'SITE_NAME_INV'].to_list())
+    stations_no_data = [i for i in stations if (i not in sites_with_conductor_label and i != 'Cascade')]
+    conductor_upgrade = INVdf.loc[((INVdf['COMPONENT'] == 'Conductor Wire')
+                                  & (INVdf['MODEL'] != '30 Conductor Wire')
+                                  & (INVdf['MODEL'] != '37 Conductor Wire')
+                                  & (~INVdf['COMMENTS_INV'].str.contains('30', na=False))
+                                  & (~INVdf['COMMENTS_INV'].str.contains('37', na=False))
+                                  & (~INVdf['DESCRIPTION'].str.contains('30', na=False))
+                                  & (~INVdf['DESCRIPTION'].str.contains('37', na=False)))]
+    stations_to_bring_cables = set(conductor_upgrade['SITE_NAME_INV'].to_list() + stations_no_data)
+    conductor_needs = {}
+    for i in stations_to_bring_cables:
+        if i in stations_no_data:
+            conductor_needs[i] = "Conductor type and length unknown. Bring 100ft cable just in case."
+        else:
+            conductor_needs[i] = 'Potential conductor cable upgrade. '
+            station_cable_info = conductor_upgrade.loc[conductor_upgrade['SITE_NAME_INV'] == i]
+            model = [station_cable_info['MODEL'].to_list()[0],
+                     station_cable_info['COMMENTS_INV'].to_list()[0],
+                     station_cable_info['DESCRIPTION'].to_list()[0]]
+            model = [' ' + i if i != None else '' for i in model]
+            if ''.join(model) != '':
+                conductor_needs[i] += f"Current cable size is: {''.join(model)}. "
+            length = [i if i != None else 'unknown' for i in station_cable_info['HEIGHT_DEPTH'].to_list()][0]
+            conductor_needs[i] += f" Length needed: {length}"
+
+    # find sites that need TXDs
+    thresh = currentYear - 5
+    txds = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Transducer")][["SITE_NAME_INV", "LOCATION"]]
+
+    # find sites that need new loggers
+    thresh = currentYear - 5
+    loggers = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Data Logger")][["SITE_NAME_INV", "MODEL"]]
+
+    # find sites that need SolarRad cal
+    thresh = currentYear - 5
+    solar_rad = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Radiometer")][["SITE_NAME_INV", "MODEL"]]
+    # find sites that need RH cal
+    thresh = currentYear - 3
+    relative_humidity = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Relative Humidity")][["SITE_NAME_INV", "MODEL"]]
+    # find sites that need Anamometer cal
+    thresh = currentYear - 5
+    wind = INVdf.loc[(INVdf['IN_DATE'].apply(lambda x: x.year) <= thresh) & (
+        INVdf['COMPONENT'] == "Wind")][["SITE_NAME_INV", "MODEL"]]
+
+    return (batts, txds, loggers, solar_rad, relative_humidity, wind, conductor_needs)
+
+    # %% Site Char
+
+
+def siteCharacteristics(metaDBData: dict):
+    '''
+    Gets infro needed from the site characteristics table. As of 3/22/2024 this is just to check if jtube is drilled
+
+    Parameters
+    ----------
+    metaDBData : dictionary of dataframes
+        initial dictionary object recieved by metaData function from arcOnline.
+
+    Returns
+    -------
+    jtubes : dataframe
+        DESCRIPTION.
+
+    '''
+    char = metaDBData['SiteChar']
+    jtubes = char.loc[(char['JTUBES_DRILLED'] != "TRUE")][["SITE_NAME_CHAR"]]
+    return jtubes
+
+
+# %% final spreadsheet
+
+def generateSpreedsheetData(siteMetData, sitesRecharged, maintenance, Sensor_Issues,
+                            revisits, latest_visits, batts, txds, loggers,
+                            solar_rad, relative_humidity, wind, jtubes, telem, conductor_needs, universal_needs=None):
+    '''
+    Function to generate spreadsheet data. This is where you define all sensor upgrades, site issues, last years notes, ect.
+    See comments below.
+
+
+    Parameters
+    ----------
+    siteMetData : TYPE
+        DESCRIPTION.
+    sitesRecharged : TYPE
+        DESCRIPTION.
+    maintenance : TYPE
+        DESCRIPTION.
+    Sensor_Issues : TYPE
+        DESCRIPTION.
+    revisits : TYPE
+        DESCRIPTION.
+    latest_visits : TYPE
+        DESCRIPTION.
+    batts : TYPE
+        DESCRIPTION.
+    txds : TYPE
+        DESCRIPTION.
+    loggers : TYPE
+        DESCRIPTION.
+    solar_rad : TYPE
+        DESCRIPTION.
+    relative_humidity : TYPE
+        DESCRIPTION.
+    wind : TYPE
+        DESCRIPTION.
+    jtubes : TYPE
+        DESCRIPTION.
+    telem : TYPE
+        DESCRIPTION.
+    universal_needs : TYPE, optional
+        DESCRIPTION. The default is None.
+
+    Returns
+    -------
+    finalList : TYPE
+        DESCRIPTION.
+    recal_counts : TYPE
+        DESCRIPTION.
+
+    '''
+    finalList = []
+    recal_counts = {}
+    recal_counts['Batteries'] = 0
+    recal_counts['Transducers'] = 0
+    recal_counts['Loggers'] = 0
+    recal_counts['Solar Rad'] = 0
+    recal_counts['Relative Humidity'] = 0
+    recal_counts['Anamometers'] = 0
+
+
+    for name, recharge, state in siteMetData.itertuples(index=False):
+
+        # determine summer maintainnce site status
+        if not recharge or recharge == '' or np.isnan(recharge):
+            recharge = ''
+        else:
+            recharge = f'{int(recharge)} gallons'
+        if name in sitesRecharged:
+            if name not in revisits:
+                siteStatus = "Recharged"
+            else:
+                siteStatus = "Needs Revisit"
+        else:
+            siteStatus = "Not Complete"
+        # get last years notes
+        if not latest_visits.loc[latest_visits["SITE_NAME_SS"] == name, "WORKDONE_SS"].empty:
+            last_notes = latest_visits.loc[latest_visits["SITE_NAME_SS"]
+                                           == name, "WORKDONE_SS"].values[0]
+        else:
+            last_notes = ""
+        # get current maintainance needs
+        if not maintenance.loc[maintenance["SITE_NAME_SS"] == name, "COMMENTS_SS"].empty:
+            needs = maintenance.loc[maintenance["SITE_NAME_SS"]
+                                    == name, "COMMENTS_SS"].dropna().values
+            if type(needs) != 'NoneType':
+                needs = '.\n'.join(needs)
+            else:
+                needs = ''
+        else:
+            needs = ''
+        if universal_needs:
+            if name not in sitesRecharged:
+                if needs == '':
+                    needs = universal_needs
+                else:
+                    needs = f'{needs} {universal_needs}'
+        # get all site issues
+        if not Sensor_Issues.loc[Sensor_Issues["SITE_NAME_SS"] == name].empty:
+            iss = Sensor_Issues.loc[Sensor_Issues["SITE_NAME_SS"] == name, [
+                'ISSUE_SS', 'BEHAVIOR_SS', 'COMMENTS_SS']].values
+            issues = ''
+            for k in range(0, iss.shape[0]):
+                indIss = list(iss[k, :])
+                indIss = [i if i != None else '' for i in indIss]
+                indIss[0] = indIss[0] + ':'
+                issues += '; '+' '.join(indIss)
+            issues = issues[2:]
+        else:
+            issues = ''
+        ### sensor replacements ### gets all sensors that need to replaced in a single string
+        sensor_replacement = ''
+        # battery replacements
+        if not batts.loc[batts["SITE_NAME_INV"] == name].empty:
+            bts = batts.loc[batts["SITE_NAME_INV"] == name].values
+            bts_loc = bts[:, 2]
+            recal_counts['Batteries'] += bts_loc.shape[0]
+            btr = ', '.join(
+                [i + ' battery' if i != None else 'other battery' for i in bts_loc])
+            sensor_replacement += f'{btr}'
+
+        # transducer upgrades
+        if not txds.loc[txds["SITE_NAME_INV"] == name].empty:
+            trans = txds.loc[txds["SITE_NAME_INV"] == name].values
+            allTrans = []
+            for k in range(trans.shape[0]):
+                allTrans.append(
+                    ' '.join([str(j) for j in trans[k, 1:]]) + ' transducer')
+            ttrans = ', '.join(allTrans)
+            recal_counts['Transducers'] += len(allTrans)
+            # replace all None -if location unknow with blank string
+            ttrans = ttrans.replace('None', '')
+            sensor_replacement += f', {ttrans}'
+        # logger upgrades
+        if not loggers.loc[loggers["SITE_NAME_INV"] == name].empty:
+            recal_counts['Loggers'] += 1
+            ltype = loggers.loc[loggers["SITE_NAME_INV"]
+                                == name, "MODEL"].values[0]
+            if ltype:
+                loggs = f', replace Logger {ltype}'
+            else:
+                loggs = ', replace Logger - type unknown'
+            sensor_replacement += f'{loggs}'
+        if sensor_replacement[:2] == ", ":
+            sensor_replacement = sensor_replacement[2:]
+        # Solar Radiation recalibration schedule checker
+        if not solar_rad.loc[solar_rad["SITE_NAME_INV"] == name].empty:
+            recal_counts['Solar Rad'] += 1
+            ltype = solar_rad.loc[solar_rad["SITE_NAME_INV"]
+                                  == name, "MODEL"].values[0]
+            if ltype:
+                SRstring = f', replace {ltype} radiometer or check database is updated'
+            else:
+                SRstring = ', replace radiometer or check database is updated'
+            sensor_replacement += f'{SRstring}'
+        if sensor_replacement[:2] == ", ":
+            sensor_replacement = sensor_replacement[2:]
+        # RH recalibration schedule checker
+        if not relative_humidity.loc[relative_humidity["SITE_NAME_INV"] == name].empty:
+            recal_counts['Relative Humidity'] += 1
+            ltype = relative_humidity.loc[relative_humidity["SITE_NAME_INV"]
+                                          == name, "MODEL"].values[0]
+            if ltype:
+                RHstring = f', replace {ltype} relative humidity sensor or check database is updated'
+            else:
+                RHstring = ', replace relative humidity sensor or check database is updated'
+            sensor_replacement += f'{RHstring}'
+        if sensor_replacement[:2] == ", ":
+            sensor_replacement = sensor_replacement[2:]
+        # Wind recalibration schedule checker
+        if not wind.loc[wind["SITE_NAME_INV"] == name].empty:
+            recal_counts['Anamometers'] += 1
+            ltype = wind.loc[wind["SITE_NAME_INV"] == name, "MODEL"].values[0]
+            if ltype:
+                Windstring = f', replace {ltype} anamometer or check database is updated'
+            else:
+                Windstring = ', replace anamometer or check database is updated'
+            sensor_replacement += f'{Windstring}'
+        if sensor_replacement[:2] == ", ":
+            sensor_replacement = sensor_replacement[2:]
+        #STATION UPGRADES
+        station_upgrades = ""
+        # jtube status
+        if not jtubes.loc[jtubes["SITE_NAME_CHAR"] == name].empty:
+            jt = "Drill jtube or check box in Site Characteristics if complete,"
+            station_upgrades += f'{jt}'
+        # check if telemetry table is completed and check if station needs is still on Meteor Burst
+        if telem.loc[(telem["SITE_NAME_TELEM"] == name), "TELEMETRY_TYPE"].empty:
+            tl = " Fill out Telemetry Table "
+            station_upgrades += f'{tl}'
+        else:
+            if telem.loc[(telem["SITE_NAME_TELEM"] == name), "TELEMETRY_TYPE"].values[0] == "Cell":
+                tl_upgrade = " ST300 and AM 16/32 install required at cell site"
+                station_upgrades += f'{tl_upgrade}'
+        if station_upgrades != "":
+            if station_upgrades[-1] == ",":
+                station_upgrades = station_upgrades[:-1]
+        #Condunctor Wire upgrades
+        if name in conductor_needs:
+            if station_upgrades == "":
+                station_upgrades = conductor_needs[name]
+            else:
+                station_upgrades += f'. {conductor_needs[name]}'
+
+        # create final dictionary of spreadsheet columns.
+        finalList.append(
+            {"Site Name": name,
+             "State": state,
+             "Recharge": recharge,
+             "Maintenance Status": siteStatus,
+             "Site Needs": needs,
+             "Site Issues": issues,
+             "Remove for Recalibration": sensor_replacement,
+             "Station Upgrades": station_upgrades,
+             "Notes from Last Visit": last_notes}
+        )
+    return finalList, recal_counts
+
+# %%
+
+
+def generateSpreedsheet(dirLoc, finalList, siteMetData, sitesRecharged, revisits, recal_counts):
+    '''
+    This is the function that takes the spreadsheet data and generates the spreadsheet.
+    The script automatically creates if not already availible a "static" directory and adds the spreadsheet into.
+    This directory is link on python anywhere to the server to be served.
+
+
+    Parameters
+    ----------
+    dirLoc : TYPE
+        DESCRIPTION.
+    finalList : TYPE
+        DESCRIPTION.
+    siteMetData : TYPE
+        DESCRIPTION.
+    sitesRecharged : TYPE
+        DESCRIPTION.
+    revisits : TYPE
+        DESCRIPTION.
+    recal_counts : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    '''
+    current_date = str(datetime.datetime.now())[:10]
+    finaldf = pd.DataFrame(finalList)
+    finaldf.to_excel(
+        dirLoc + f'Maintenance_Spreadsheet_{current_date}.xlsx', index=False, sheet_name="Station Needs")
+
+    wb = load_workbook(dirLoc + f'Maintenance_Spreadsheet_{current_date}.xlsx')
+
+    #### maintenance needs spreadsheet #####
+    # create the maintenance needs spreadsheet object as a spreadsheet tab in the workbook
+    ws = wb['Station Needs']
+
+    # add table to the maintenance needs spreadsheet
+    style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False,
+                           showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+    table = Table(displayName="Table1",
+                  ref=f'A1:I{finaldf.shape[0]+1}', tableStyleInfo=style)
+    ws.add_table(table)
+    ws.freeze_panes
+
+    # loop through all cells in each column to set format for the maintenance spreadsheet
+    column_letters = tuple(openpyxl.utils.get_column_letter(
+        col_number + 1) for col_number in range(ws.max_column))
+    for i, j in it.product(column_letters, range(0, finaldf.shape[0]+1)):
+        if j == 0:
+            ws[f'{i}{j+1}'].alignment = Alignment(vertical="center")
+        else:
+            ws[f'{i}{j+1}'].alignment = Alignment(
+                wrapText=True, vertical="center")
+        if (finaldf['Maintenance Status'] == 'Needs Revisit').iloc[j-1]:
+            ws[f'{i}{j+1}'].fill = PatternFill(start_color='00FFFF00', end_color='00FFFF00',
+                                               fill_type="solid")
+        elif (finaldf['Maintenance Status'] == 'Recharged').iloc[j-1]:
+            ws[f'{i}{j+1}'].fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE',
+                                               fill_type="solid")
+    # set column with as best fit and width of 50
+    for column_letter in column_letters:
+        if column_letter in ["A", "B", "C"]:
+            ws.column_dimensions[column_letter].bestFit = True
+        elif column_letter == "D":
+            ws.column_dimensions[column_letter].width = 20
+        else:
+            ws.column_dimensions[column_letter].width = 50
+
+    #### Summary Spreadsheet ######
+    # site visit summary
+    summary_ss = wb.create_sheet('Maintenance Summary')
+
+    pie_chart_data = [
+        ['Station Status', 'number of site',
+            f'spreadsheet current as of: {current_date}'],
+        ['Not Recharged', siteMetData.shape[0]-len(sitesRecharged)],
+        ['Recharge Complete', len(sitesRecharged)-len(revisits)],
+        ['Revisits', len(revisits)],
+        ['Total Stations', siteMetData.shape[0]]
+    ]
+
+    for row in pie_chart_data:
+        summary_ss.append(row)
+
+    summary_ss.column_dimensions['A'].auto_size = True
+    summary_ss.column_dimensions['B'].auto_size = True
+    pie = PieChart()
+    labels = Reference(summary_ss, min_col=1, min_row=2, max_row=4)
+    data = Reference(summary_ss, min_col=2, min_row=1, max_row=4)
+    pie.add_data(data, titles_from_data=True)
+    pie.set_categories(labels)
+    pie.title = f"CODCO Station Status for {currentYear}"
+
+    summary_ss.add_chart(pie, "D2")
+    # needed items for recal
+    summary_ss.merge_cells('M1:R1')
+    summary_ss['M1'] = 'Equipment Needed for Recalibration'
+    summary_ss['M1'].alignment = Alignment(horizontal="center")
+    header_recal = {i: j for i, j in zip(
+        ascii_uppercase[12:], recal_counts.keys())}
+    data_recal = {i: j for i, j in zip(
+        ascii_uppercase[12:], recal_counts.values())}
+    for i in header_recal:
+        summary_ss[i+str(2)].value = header_recal[i]
+        summary_ss.column_dimensions[i].auto_size = True
+    for i in data_recal:
+        summary_ss[i+str(3)].value = data_recal[i]
+    wb.save(dirLoc + f'Maintenance_Spreadsheet_{current_date}.xlsx')
+
+# %% run program
+
+
+if __name__ == "__main__":
+    username = 'joel.atwood_nrcs'
+    password = '3504nmolter!'
+    currentYear = datetime.datetime.now().year
+    metaDBData = run_in_thread(username, password)
+    siteMetData = metaData(metaDBData)
+    sitesRecharged = sitesRechargedmetaDBData(metaDBData)
+    maintenance, Sensor_Issues, revisits, latest_visits = snowStats(
+        metaDBData, sitesRecharged)
+    batts, txds, loggers, solar_rad, relative_humidity, wind, conductor_needs = Invitory(
+        metaDBData)
+    jtubes = siteCharacteristics(metaDBData)
+    telem = metaDBData['Telemetry']
+    universal_needs = '''.'''
+    finalList, recal_counts = generateSpreedsheetData(siteMetData,
+                                                      sitesRecharged,
+                                                      maintenance,
+                                                      Sensor_Issues,
+                                                      revisits,
+                                                      latest_visits,
+                                                      batts,
+                                                      txds,
+                                                      loggers,
+                                                      solar_rad,
+                                                      relative_humidity,
+                                                      wind,
+                                                      jtubes,
+                                                      telem,
+                                                      conductor_needs,
+                                                      universal_needs)
+    location = './static/'
+    if not os.path.exists(location):
+        os.makedirs(location)
+    else:
+        for f in os.listdir(location):
+            os.remove(os.path.join(location, f))
+    generateSpreedsheet(location, finalList, siteMetData,
+                        sitesRecharged, revisits, recal_counts)
